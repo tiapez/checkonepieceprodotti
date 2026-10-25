@@ -555,10 +555,6 @@ def check_once(session: requests.Session, store: Store, shops: list[str], token:
             elif new:
                 logging.info("Trovati %d nuovi prodotti su %s", len(new), shop)
                 for product in new:
-                    if not product.available:
-                        logging.info("Nuovo prodotto non disponibile, memorizzato senza notifica: %s", product.title)
-                        store.confirm(shop, product)
-                        continue
                     if dry_run:
                         logging.info("DRY RUN: %s - %s", product.title, product.url)
                     else:

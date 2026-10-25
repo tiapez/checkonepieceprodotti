@@ -69,6 +69,10 @@ Qualunque utente può aprire il bot su Telegram e usare:
 - `/stop` per annullare l'iscrizione;
 - `/help` per visualizzare i comandi disponibili.
 
+Il riepilogo inviato all'iscrizione contiene soltanto gli articoli disponibili
+o prenotabili. Le notifiche successive riguardano invece **tutti** i nuovi
+prodotti, anche quando risultano esauriti o non disponibili.
+
 Gli iscritti e l'ultimo comando elaborato sono salvati nello stesso database
 conservato dalla cache di Actions. Poiché il workflow parte ogni 10 minuti, la
 risposta ai comandi non è istantanea e può arrivare al controllo successivo.
