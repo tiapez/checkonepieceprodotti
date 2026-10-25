@@ -64,8 +64,8 @@ memorizzati i prodotti esistenti senza inviare notifiche.
 
 Qualunque utente può aprire il bot su Telegram e usare:
 
-- `/start` per iscriversi, ricevere il catalogo corrente in formato `.txt` e le
-  notifiche future;
+- `/start` per iscriversi, ricevere un messaggio per negozio con i prodotti
+  disponibili o prenotabili e le notifiche future;
 - `/stop` per annullare l'iscrizione;
 - `/help` per visualizzare i comandi disponibili.
 

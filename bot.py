@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import platform
+import re
 import signal
 import sqlite3
 import sys
@@ -36,6 +37,36 @@ class Product:
     key: str
     title: str
     url: str
+    available: bool = True
+
+
+UNAVAILABLE_WORDS = (
+    "esaurito",
+    "non disponibile",
+    "out of stock",
+    "outofstock",
+    "sold out",
+    "temporaneamente non disponibile",
+)
+
+
+def availability_from_text(value: str) -> bool:
+    text = " ".join(value.lower().split())
+    return not any(word in text for word in UNAVAILABLE_WORDS)
+
+
+def _card_available(node) -> bool:
+    own_classes = " ".join(node.get("class", [])) if hasattr(node, "get") else ""
+    card = node if re.search(r"product|prodotto|s_item", own_classes, re.I) else None
+    if card is None:
+        card = node.find_parent(
+            ["li", "article", "div"],
+            class_=re.compile(r"product|prodotto|s_item", re.I),
+        )
+    if card is None:
+        return True
+    classes = " ".join(card.get("class", []))
+    return availability_from_text(f"{classes} {card.get_text(' ', strip=True)}")
 
 
 def clean_url(url: str, base: str = "") -> str:
@@ -82,7 +113,11 @@ def extract_products(page_url: str, body: str) -> list[Product]:
                 url = obj["offers"].get("url")
             if title and url:
                 normalized = clean_url(str(url), page_url)
-                found[product_key(normalized)] = Product(product_key(normalized), title, normalized)
+                offers = obj.get("offers")
+                offer = offers[0] if isinstance(offers, list) and offers else offers
+                availability = str(offer.get("availability") or "") if isinstance(offer, dict) else ""
+                available = availability_from_text(availability)
+                found[product_key(normalized)] = Product(product_key(normalized), title, normalized, available)
 
     # Copre Shopify (/products/) e molti cataloghi WooCommerce (/prodotto/).
     selectors = (
@@ -101,7 +136,7 @@ def extract_products(page_url: str, body: str) -> list[Product]:
             key = product_key(normalized)
             # Preferisce il titolo più descrittivo tra link duplicati.
             if key not in found or len(title) > len(found[key].title):
-                found[key] = Product(key, title, normalized)
+                found[key] = Product(key, title, normalized, _card_available(anchor))
 
     # Titolo WooCommerce quando il permalink è annidato nella categoria stessa.
     for anchor in soup.select(".woocommerce-loop-product__title a[href]"):
@@ -109,7 +144,7 @@ def extract_products(page_url: str, body: str) -> list[Product]:
         if title:
             normalized = clean_url(anchor.get("href", ""), page_url)
             key = product_key(normalized)
-            found[key] = Product(key, title[:300], normalized)
+            found[key] = Product(key, title[:300], normalized, _card_available(anchor))
 
     # Tema proprietario di Magic Store.
     for card in soup.select(".s_item"):
@@ -125,7 +160,7 @@ def extract_products(page_url: str, body: str) -> list[Product]:
             title = title_link.get_text(" ", strip=True)
             normalized = clean_url(href, page_url)
             key = product_key(normalized)
-            found[key] = Product(key, title[:300], normalized)
+            found[key] = Product(key, title[:300], normalized, _card_available(card))
 
     # Temi WooCommerce/PrestaShop con URL personalizzati (es. Rumble Store).
     cards = soup.select(
@@ -147,7 +182,7 @@ def extract_products(page_url: str, body: str) -> list[Product]:
             normalized = clean_url(anchor.get("href", ""), page_url)
             if normalized.startswith(("http://", "https://")):
                 key = product_key(normalized)
-                found[key] = Product(key, title[:300], normalized)
+                found[key] = Product(key, title[:300], normalized, _card_available(card))
     return list(found.values())
 
 
@@ -167,7 +202,9 @@ def _products_from_shopify(data: dict, base_url: str) -> list[Product]:
         handle = str(item.get("handle") or "").strip()
         if title and handle:
             url = clean_url(f"/products/{handle}", base_url)
-            found.append(Product(product_key(url), title, url))
+            variants = item.get("variants") or []
+            available = any(bool(variant.get("available")) for variant in variants)
+            found.append(Product(product_key(url), title, url, available))
     return found
 
 
@@ -178,7 +215,7 @@ def _products_from_woocommerce(data: list, base_url: str) -> list[Product]:
         url = str(item.get("permalink") or "").strip()
         if title and url:
             url = clean_url(url, base_url)
-            found.append(Product(product_key(url), title, url))
+            found.append(Product(product_key(url), title, url, bool(item.get("is_in_stock", True))))
     return found
 
 
@@ -273,6 +310,8 @@ class Store:
         columns = {row[1] for row in self.db.execute("PRAGMA table_info(products)")}
         if "active" not in columns:
             self.db.execute("ALTER TABLE products ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
+        if "available" not in columns:
+            self.db.execute("ALTER TABLE products ADD COLUMN available INTEGER NOT NULL DEFAULT 1")
         self.db.execute(
             "CREATE TABLE IF NOT EXISTS shops (shop_url TEXT PRIMARY KEY, initialized INTEGER NOT NULL DEFAULT 0)"
         )
@@ -303,9 +342,9 @@ class Store:
             with self.db:
                 self.db.execute("UPDATE products SET active=0 WHERE shop_url=?", (shop_url,))
                 self.db.executemany(
-                    "UPDATE products SET active=1, title=?, product_url=? "
+                    "UPDATE products SET active=1, available=?, title=?, product_url=? "
                     "WHERE shop_url=? AND product_key=?",
-                    [(p.title, p.url, shop_url, p.key) for p in products],
+                    [(int(p.available), p.title, p.url, shop_url, p.key) for p in products],
                 )
             return True, [product for product in products if product.key not in known]
 
@@ -314,8 +353,9 @@ class Store:
             for product in products:
                 self.db.execute(
                     "INSERT OR IGNORE INTO products"
-                    "(shop_url,product_key,title,product_url,first_seen,active) VALUES (?, ?, ?, ?, ?, 1)",
-                    (shop_url, product.key, product.title, product.url, now),
+                    "(shop_url,product_key,title,product_url,first_seen,active,available) "
+                    "VALUES (?, ?, ?, ?, ?, 1, ?)",
+                    (shop_url, product.key, product.title, product.url, now, int(product.available)),
                 )
             self.db.execute(
                 "INSERT INTO shops(shop_url, initialized) VALUES(?, 1) "
@@ -328,10 +368,10 @@ class Store:
         """Segna visto un prodotto soltanto dopo una notifica riuscita."""
         with self.db:
             self.db.execute(
-                "INSERT INTO products(shop_url,product_key,title,product_url,first_seen,active) "
-                "VALUES (?, ?, ?, ?, ?, 1) ON CONFLICT(shop_url,product_key) DO UPDATE SET "
-                "title=excluded.title, product_url=excluded.product_url, active=1",
-                (shop_url, product.key, product.title, product.url, int(time.time())),
+                "INSERT INTO products(shop_url,product_key,title,product_url,first_seen,active,available) "
+                "VALUES (?, ?, ?, ?, ?, 1, ?) ON CONFLICT(shop_url,product_key) DO UPDATE SET "
+                "title=excluded.title, product_url=excluded.product_url, active=1, available=excluded.available",
+                (shop_url, product.key, product.title, product.url, int(time.time()), int(product.available)),
             )
 
     def subscribe(self, chat_id: str) -> bool:
@@ -363,23 +403,20 @@ class Store:
             )
         ]
 
-    def catalog_text(self) -> str:
-        lines = ["CATALOGO PRODOTTI PER NEGOZIO", ""]
+    def available_catalogs(self) -> list[tuple[str, list[tuple[str, str]]]]:
+        catalogs = []
         shops = self.db.execute(
             "SELECT shop_url FROM shops WHERE initialized=1 ORDER BY shop_url"
         ).fetchall()
         for (shop_url,) in shops:
-            host = urlsplit(shop_url).netloc.removeprefix("www.")
             products = self.db.execute(
                 "SELECT title, product_url FROM products WHERE shop_url=? AND active=1 "
+                "AND available=1 "
                 "ORDER BY title COLLATE NOCASE",
                 (shop_url,),
             ).fetchall()
-            lines.extend([f"=== {host} ({len(products)} prodotti) ===", ""])
-            for title, url in products:
-                lines.extend([title, url])
-            lines.append("")
-        return "\n".join(lines)
+            catalogs.append((shop_url, products))
+        return catalogs
 
     def catalog_sent(self, chat_id: str) -> None:
         with self.db:
@@ -466,15 +503,42 @@ def process_subscriptions(session: requests.Session, store: Store, token: str) -
 
 
 def send_pending_catalogs(session: requests.Session, store: Store, token: str) -> None:
-    content = store.catalog_text().encode("utf-8")
     for chat_id in store.pending_catalogs():
-        response = session.post(
-            f"https://api.telegram.org/bot{token}/sendDocument",
-            data={"chat_id": chat_id, "caption": "📋 Prodotti rilevati, suddivisi per negozio"},
-            files={"document": ("catalogo_prodotti.txt", content, "text/plain")},
-            timeout=30,
-        )
-        response.raise_for_status()
+        for shop_url, products in store.available_catalogs():
+            host = urlsplit(shop_url).netloc.removeprefix("www.")
+            header = (
+                f"🏪 <b>{html.escape(host)}</b>\n"
+                f"Disponibili o prenotabili: <b>{len(products)}</b>\n\n"
+            )
+            if not products:
+                body = "Nessun prodotto attualmente disponibile."
+            else:
+                entries = [
+                    f'• <a href="{html.escape(url, quote=True)}">{html.escape(title)}</a>'
+                    for title, url in products
+                ]
+                selected: list[str] = []
+                for entry in entries:
+                    omitted = len(entries) - len(selected) - 1
+                    suffix = f"\n\n…e altri {omitted} prodotti." if omitted else ""
+                    if len(header) + len("\n".join(selected + [entry])) + len(suffix) > 3900:
+                        break
+                    selected.append(entry)
+                omitted = len(entries) - len(selected)
+                body = "\n".join(selected)
+                if omitted:
+                    body += f"\n\n…e altri {omitted} prodotti disponibili."
+            response = session.post(
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                data={
+                    "chat_id": chat_id,
+                    "text": header + body,
+                    "parse_mode": "HTML",
+                    "disable_web_page_preview": True,
+                },
+                timeout=30,
+            )
+            response.raise_for_status()
         store.catalog_sent(chat_id)
 
 
@@ -491,6 +555,10 @@ def check_once(session: requests.Session, store: Store, shops: list[str], token:
             elif new:
                 logging.info("Trovati %d nuovi prodotti su %s", len(new), shop)
                 for product in new:
+                    if not product.available:
+                        logging.info("Nuovo prodotto non disponibile, memorizzato senza notifica: %s", product.title)
+                        store.confirm(shop, product)
+                        continue
                     if dry_run:
                         logging.info("DRY RUN: %s - %s", product.title, product.url)
                     else:
