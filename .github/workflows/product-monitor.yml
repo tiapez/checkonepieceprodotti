@@ -11,7 +11,7 @@ permissions:
 
 concurrency:
   group: product-monitor
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   check-products:
