@@ -1,0 +1,436 @@
+"""Controlla pagine di negozi online e notifica i nuovi prodotti su Telegram."""
+
+from __future__ import annotations
+
+import hashlib
+import html
+import json
+import logging
+import os
+import platform
+import signal
+import sqlite3
+import sys
+import time
+import atexit
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable
+from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
+
+import requests
+from bs4 import BeautifulSoup
+from dotenv import load_dotenv
+
+
+ROOT = Path(__file__).resolve().parent
+DB_PATH = ROOT / "prodotti_visti.db"
+SHOPS_PATH = ROOT / "elenco_negozi.txt"
+USER_AGENT = "Mozilla/5.0 (compatible; TelegramProductWatcher/1.0)"
+TRACKING_PREFIXES = ("utm_", "fbclid", "gclid", "_gl")
+_browser_driver = None
+
+
+@dataclass(frozen=True)
+class Product:
+    key: str
+    title: str
+    url: str
+
+
+def clean_url(url: str, base: str = "") -> str:
+    absolute = urljoin(base, url)
+    parts = urlsplit(absolute)
+    query = [(k, v) for k, v in parse_qsl(parts.query) if not k.lower().startswith(TRACKING_PREFIXES)]
+    # Alcuni server distinguono /categoria da /categoria/ (e rispondono 404).
+    path = parts.path or "/"
+    return urlunsplit((parts.scheme.lower(), parts.netloc.lower(), path, urlencode(query), ""))
+
+
+def product_key(url: str) -> str:
+    return hashlib.sha256(clean_url(url).encode("utf-8")).hexdigest()
+
+
+def _json_objects(value):
+    if isinstance(value, list):
+        for item in value:
+            yield from _json_objects(item)
+    elif isinstance(value, dict):
+        yield value
+        if "@graph" in value:
+            yield from _json_objects(value["@graph"])
+
+
+def extract_products(page_url: str, body: str) -> list[Product]:
+    """Estrae prodotti da JSON-LD e link di catalogo, eliminando i duplicati."""
+    soup = BeautifulSoup(body, "html.parser")
+    found: dict[str, Product] = {}
+
+    for script in soup.select('script[type="application/ld+json"]'):
+        try:
+            data = json.loads(script.string or script.get_text())
+        except (json.JSONDecodeError, TypeError):
+            continue
+        for obj in _json_objects(data):
+            kind = obj.get("@type", "")
+            kinds = kind if isinstance(kind, list) else [kind]
+            if "Product" not in kinds:
+                continue
+            title = str(obj.get("name") or "").strip()
+            url = obj.get("url")
+            if not url and isinstance(obj.get("offers"), dict):
+                url = obj["offers"].get("url")
+            if title and url:
+                normalized = clean_url(str(url), page_url)
+                found[product_key(normalized)] = Product(product_key(normalized), title, normalized)
+
+    # Copre Shopify (/products/) e molti cataloghi WooCommerce (/prodotto/).
+    selectors = (
+        'a[href*="/products/"], a[href*="/product/"], '
+        'a[href*="/prodotto/"], a[href*="/prodotti/"]'
+    )
+    for anchor in soup.select(selectors):
+        title = (anchor.get("title") or anchor.get_text(" ", strip=True)).strip()
+        if not title:
+            image = anchor.find("img")
+            title = ((image.get("alt") if image else "") or "").strip()
+        if not title or len(title) > 300:
+            continue
+        normalized = clean_url(anchor.get("href", ""), page_url)
+        if normalized.startswith(("http://", "https://")):
+            key = product_key(normalized)
+            # Preferisce il titolo più descrittivo tra link duplicati.
+            if key not in found or len(title) > len(found[key].title):
+                found[key] = Product(key, title, normalized)
+
+    # Titolo WooCommerce quando il permalink è annidato nella categoria stessa.
+    for anchor in soup.select(".woocommerce-loop-product__title a[href]"):
+        title = anchor.get_text(" ", strip=True)
+        if title:
+            normalized = clean_url(anchor.get("href", ""), page_url)
+            key = product_key(normalized)
+            found[key] = Product(key, title[:300], normalized)
+
+    # Tema proprietario di Magic Store.
+    for card in soup.select(".s_item"):
+        image_link = card.select_one("a.s_thumb[href]")
+        if not image_link:
+            continue
+        href = image_link.get("href", "")
+        title_link = next(
+            (a for a in card.select("a[href]") if a.get("href") == href and a.get_text(" ", strip=True)),
+            None,
+        )
+        if title_link:
+            title = title_link.get_text(" ", strip=True)
+            normalized = clean_url(href, page_url)
+            key = product_key(normalized)
+            found[key] = Product(key, title[:300], normalized)
+
+    # Temi WooCommerce/PrestaShop con URL personalizzati (es. Rumble Store).
+    cards = soup.select(
+        "li.product, article.product, .product-item, .product-miniature, "
+        "[data-product-id], [data-product_id]"
+    )
+    for card in cards:
+        title_node = card.select_one(
+            "h2, h3, h4, .product-title, .product-name, .woocommerce-loop-product__title"
+        )
+        anchors = card.select("a[href]")
+        anchor = next((a for a in anchors if title_node and a.find(title_node.name)), None)
+        if anchor is None and title_node:
+            anchor = title_node.find_parent("a", href=True)
+        if anchor is None:
+            anchor = next((a for a in anchors if a.get_text(" ", strip=True)), None)
+        title = title_node.get_text(" ", strip=True) if title_node else ""
+        if anchor and title:
+            normalized = clean_url(anchor.get("href", ""), page_url)
+            if normalized.startswith(("http://", "https://")):
+                key = product_key(normalized)
+                found[key] = Product(key, title[:300], normalized)
+    return list(found.values())
+
+
+def _shopify_catalog_url(shop_url: str) -> str | None:
+    parts = urlsplit(shop_url)
+    marker = "/collections/"
+    if marker not in parts.path:
+        return None
+    collection = parts.path.split(marker, 1)[1].strip("/").split("/", 1)[0]
+    return urlunsplit((parts.scheme, parts.netloc, f"/collections/{collection}/products.json", "limit=250", ""))
+
+
+def _products_from_shopify(data: dict, base_url: str) -> list[Product]:
+    found = []
+    for item in data.get("products", []):
+        title = str(item.get("title") or "").strip()
+        handle = str(item.get("handle") or "").strip()
+        if title and handle:
+            url = clean_url(f"/products/{handle}", base_url)
+            found.append(Product(product_key(url), title, url))
+    return found
+
+
+def _products_from_woocommerce(data: list, base_url: str) -> list[Product]:
+    found = []
+    for item in data:
+        title = str(item.get("name") or "").strip()
+        url = str(item.get("permalink") or "").strip()
+        if title and url:
+            url = clean_url(url, base_url)
+            found.append(Product(product_key(url), title, url))
+    return found
+
+
+def _fetch_with_browser(shop: str) -> list[Product]:
+    """Fallback per cataloghi pubblici che richiedono JavaScript/browser."""
+    global _browser_driver
+    if os.getenv("BROWSER_FALLBACK", "true").lower() not in {"1", "true", "yes"}:
+        return []
+    try:
+        from selenium import webdriver
+        from selenium.webdriver.support.ui import WebDriverWait
+
+        if _browser_driver is None:
+            if platform.system() == "Windows":
+                from selenium.webdriver.edge.options import Options
+
+                options = Options()
+                driver_factory = webdriver.Edge
+            else:
+                from selenium.webdriver.chrome.options import Options
+
+                options = Options()
+                driver_factory = webdriver.Chrome
+            options.add_argument("--headless=new")
+            options.add_argument("--disable-gpu")
+            options.add_argument("--no-sandbox")
+            options.add_argument("--disable-dev-shm-usage")
+            options.add_argument("--window-size=1440,1200")
+            options.add_argument("--lang=it-IT")
+            _browser_driver = driver_factory(options=options)
+            _browser_driver.set_page_load_timeout(45)
+            atexit.register(lambda: _browser_driver and _browser_driver.quit())
+        _browser_driver.get(shop)
+        WebDriverWait(_browser_driver, 15).until(
+            lambda driver: driver.execute_script("return document.readyState") == "complete"
+        )
+        return extract_products(_browser_driver.current_url, _browser_driver.page_source)
+    except Exception as exc:
+        logging.warning("Fallback browser non riuscito per %s: %s", shop, exc)
+        return []
+
+
+def fetch_products(session: requests.Session, shop: str) -> list[Product]:
+    """Prova cataloghi pubblici prima della pagina HTML."""
+    shopify_url = _shopify_catalog_url(shop)
+    if shopify_url:
+        try:
+            response = session.get(shopify_url, timeout=30)
+            response.raise_for_status()
+            products = _products_from_shopify(response.json(), shop)
+            if products:
+                return products
+        except (requests.RequestException, ValueError):
+            pass
+
+    try:
+        response = session.get(shop, timeout=30)
+        response.raise_for_status()
+        return extract_products(response.url, response.text)
+    except requests.HTTPError as page_error:
+        if page_error.response is None or page_error.response.status_code not in {403, 429}:
+            raise
+        # Store API di WooCommerce: endpoint pubblico, senza credenziali.
+        parts = urlsplit(shop)
+        api_url = urlunsplit(
+            (parts.scheme, parts.netloc, "/wp-json/wc/store/v1/products", "search=one%20piece&per_page=100", "")
+        )
+        try:
+            response = session.get(api_url, timeout=30)
+            response.raise_for_status()
+            products = _products_from_woocommerce(response.json(), shop)
+            if products:
+                return products
+        except (requests.RequestException, ValueError):
+            pass
+        products = _fetch_with_browser(shop)
+        if products:
+            return products
+        raise page_error
+
+
+class Store:
+    def __init__(self, path: Path):
+        self.db = sqlite3.connect(path)
+        self.db.execute("PRAGMA journal_mode=WAL")
+        self.db.execute(
+            "CREATE TABLE IF NOT EXISTS products ("
+            " shop_url TEXT NOT NULL, product_key TEXT NOT NULL, title TEXT NOT NULL, "
+            " product_url TEXT NOT NULL, first_seen INTEGER NOT NULL, "
+            " PRIMARY KEY (shop_url, product_key))"
+        )
+        self.db.execute(
+            "CREATE TABLE IF NOT EXISTS shops (shop_url TEXT PRIMARY KEY, initialized INTEGER NOT NULL DEFAULT 0)"
+        )
+        self.db.commit()
+
+    def record(self, shop_url: str, products: Iterable[Product]) -> tuple[bool, list[Product]]:
+        """Salva la baseline; dopo, restituisce i prodotti non ancora confermati."""
+        products = list(products)
+        initialized = self.db.execute(
+            "SELECT initialized FROM shops WHERE shop_url = ?", (shop_url,)
+        ).fetchone()
+        was_initialized = bool(initialized and initialized[0])
+        if was_initialized:
+            known = {
+                row[0]
+                for row in self.db.execute(
+                    "SELECT product_key FROM products WHERE shop_url = ?", (shop_url,)
+                )
+            }
+            return True, [product for product in products if product.key not in known]
+
+        now = int(time.time())
+        with self.db:
+            for product in products:
+                self.db.execute(
+                    "INSERT OR IGNORE INTO products VALUES (?, ?, ?, ?, ?)",
+                    (shop_url, product.key, product.title, product.url, now),
+                )
+            self.db.execute(
+                "INSERT INTO shops(shop_url, initialized) VALUES(?, 1) "
+                "ON CONFLICT(shop_url) DO UPDATE SET initialized=1",
+                (shop_url,),
+            )
+        return False, []
+
+    def confirm(self, shop_url: str, product: Product) -> None:
+        """Segna visto un prodotto soltanto dopo una notifica riuscita."""
+        with self.db:
+            self.db.execute(
+                "INSERT OR IGNORE INTO products VALUES (?, ?, ?, ?, ?)",
+                (shop_url, product.key, product.title, product.url, int(time.time())),
+            )
+
+
+def load_shops(path: Path) -> list[str]:
+    shops = []
+    for raw in path.read_text(encoding="utf-8-sig").splitlines():
+        line = raw.strip()
+        if line and not line.startswith("#"):
+            shops.append(clean_url(line))
+    return list(dict.fromkeys(shops))
+
+
+def send_telegram(session: requests.Session, token: str, chat_id: str, shop: str, product: Product) -> None:
+    host = urlsplit(shop).netloc
+    message = (
+        "🆕 <b>Nuovo prodotto</b>\n"
+        f"<b>{html.escape(product.title)}</b>\n"
+        f"Negozio: {html.escape(host)}\n"
+        f'<a href="{html.escape(product.url, quote=True)}">Apri il prodotto</a>'
+    )
+    response = session.post(
+        f"https://api.telegram.org/bot{token}/sendMessage",
+        data={"chat_id": chat_id, "text": message, "parse_mode": "HTML", "disable_web_page_preview": False},
+        timeout=20,
+    )
+    response.raise_for_status()
+
+
+def check_once(session: requests.Session, store: Store, shops: list[str], token: str, chat_id: str, dry_run: bool) -> None:
+    for shop in shops:
+        try:
+            products = fetch_products(session, shop)
+            if not products:
+                logging.warning("Nessun prodotto trovato: %s", shop)
+                continue  # Non inizializzare: evitiamo falsi positivi al prossimo tentativo.
+            initialized, new = store.record(shop, products)
+            if not initialized:
+                logging.info("Baseline creata per %s: %d prodotti", shop, len(products))
+            elif new:
+                logging.info("Trovati %d nuovi prodotti su %s", len(new), shop)
+                for product in new:
+                    if dry_run:
+                        logging.info("DRY RUN: %s - %s", product.title, product.url)
+                    else:
+                        send_telegram(session, token, chat_id, shop, product)
+                    store.confirm(shop, product)
+            else:
+                logging.info("Nessuna novità su %s (%d prodotti)", shop, len(products))
+        except requests.RequestException as exc:
+            logging.error("Errore controllando %s: %s", shop, exc)
+        except Exception:
+            logging.exception("Errore inatteso controllando %s", shop)
+
+
+def print_report(session: requests.Session, shops: list[str]) -> None:
+    """Stampa un riepilogo leggibile senza modificare la baseline."""
+    rows: list[tuple[str, str]] = []
+    for shop in shops:
+        name = urlsplit(shop).netloc.removeprefix("www.")
+        try:
+            count = len(fetch_products(session, shop))
+            result = str(count) if count else "0 (nessun prodotto rilevato)"
+        except requests.RequestException as exc:
+            status = exc.response.status_code if exc.response is not None else None
+            result = f"ERRORE HTTP {status}" if status else "ERRORE DI CONNESSIONE"
+        rows.append((name, result))
+
+    width = max(len("NEGOZIO"), *(len(name) for name, _ in rows))
+    print(f"{'NEGOZIO':<{width}}  PRODOTTI RILEVATI")
+    print(f"{'-' * width}  -----------------")
+    for name, result in rows:
+        print(f"{name:<{width}}  {result}")
+
+
+def main() -> int:
+    load_dotenv(ROOT / ".env")
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    dry_run = os.getenv("DRY_RUN", "false").lower() in {"1", "true", "yes"}
+    once = "--once" in sys.argv
+    report = "--report" in sys.argv
+    if not report and not dry_run and (not token or not chat_id):
+        print("Configura TELEGRAM_BOT_TOKEN e TELEGRAM_CHAT_ID nel file .env", file=sys.stderr)
+        return 2
+    try:
+        interval = max(30, int(os.getenv("CHECK_INTERVAL_SECONDS", "300")))
+        shops = load_shops(SHOPS_PATH)
+    except (OSError, ValueError) as exc:
+        print(f"Configurazione non valida: {exc}", file=sys.stderr)
+        return 2
+    if not shops:
+        print("elenco_negozi.txt non contiene URL", file=sys.stderr)
+        return 2
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+    session = requests.Session()
+    session.headers.update({"User-Agent": USER_AGENT, "Accept-Language": "it-IT,it;q=0.9,en;q=0.7"})
+    if report:
+        print_report(session, shops)
+        return 0
+    store = Store(DB_PATH)
+    running = True
+
+    def stop(*_):
+        nonlocal running
+        running = False
+
+    signal.signal(signal.SIGINT, stop)
+    signal.signal(signal.SIGTERM, stop)
+    while running:
+        check_once(session, store, shops, token, chat_id, dry_run)
+        if once:
+            break
+        logging.info("Prossimo controllo tra %d secondi", interval)
+        for _ in range(interval):
+            if not running:
+                break
+            time.sleep(1)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

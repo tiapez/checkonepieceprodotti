@@ -1,0 +1,6 @@
+.env
+__pycache__/
+*.pyc
+prodotti_visti.db
+prodotti_visti.db-shm
+prodotti_visti.db-wal
