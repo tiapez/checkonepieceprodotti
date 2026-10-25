@@ -270,8 +270,19 @@ class Store:
             " product_url TEXT NOT NULL, first_seen INTEGER NOT NULL, "
             " PRIMARY KEY (shop_url, product_key))"
         )
+        columns = {row[1] for row in self.db.execute("PRAGMA table_info(products)")}
+        if "active" not in columns:
+            self.db.execute("ALTER TABLE products ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
         self.db.execute(
             "CREATE TABLE IF NOT EXISTS shops (shop_url TEXT PRIMARY KEY, initialized INTEGER NOT NULL DEFAULT 0)"
+        )
+        self.db.execute(
+            "CREATE TABLE IF NOT EXISTS subscribers ("
+            "chat_id TEXT PRIMARY KEY, active INTEGER NOT NULL DEFAULT 1, "
+            "pending_catalog INTEGER NOT NULL DEFAULT 1, subscribed_at INTEGER NOT NULL)"
+        )
+        self.db.execute(
+            "CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
         )
         self.db.commit()
 
@@ -289,13 +300,21 @@ class Store:
                     "SELECT product_key FROM products WHERE shop_url = ?", (shop_url,)
                 )
             }
+            with self.db:
+                self.db.execute("UPDATE products SET active=0 WHERE shop_url=?", (shop_url,))
+                self.db.executemany(
+                    "UPDATE products SET active=1, title=?, product_url=? "
+                    "WHERE shop_url=? AND product_key=?",
+                    [(p.title, p.url, shop_url, p.key) for p in products],
+                )
             return True, [product for product in products if product.key not in known]
 
         now = int(time.time())
         with self.db:
             for product in products:
                 self.db.execute(
-                    "INSERT OR IGNORE INTO products VALUES (?, ?, ?, ?, ?)",
+                    "INSERT OR IGNORE INTO products"
+                    "(shop_url,product_key,title,product_url,first_seen,active) VALUES (?, ?, ?, ?, ?, 1)",
                     (shop_url, product.key, product.title, product.url, now),
                 )
             self.db.execute(
@@ -309,8 +328,75 @@ class Store:
         """Segna visto un prodotto soltanto dopo una notifica riuscita."""
         with self.db:
             self.db.execute(
-                "INSERT OR IGNORE INTO products VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO products(shop_url,product_key,title,product_url,first_seen,active) "
+                "VALUES (?, ?, ?, ?, ?, 1) ON CONFLICT(shop_url,product_key) DO UPDATE SET "
+                "title=excluded.title, product_url=excluded.product_url, active=1",
                 (shop_url, product.key, product.title, product.url, int(time.time())),
+            )
+
+    def subscribe(self, chat_id: str) -> bool:
+        existing = self.db.execute(
+            "SELECT active FROM subscribers WHERE chat_id = ?", (chat_id,)
+        ).fetchone()
+        with self.db:
+            self.db.execute(
+                "INSERT INTO subscribers(chat_id, active, pending_catalog, subscribed_at) "
+                "VALUES(?, 1, 1, ?) ON CONFLICT(chat_id) DO UPDATE SET active=1, pending_catalog=1",
+                (chat_id, int(time.time())),
+            )
+        return not bool(existing and existing[0])
+
+    def unsubscribe(self, chat_id: str) -> None:
+        with self.db:
+            self.db.execute(
+                "UPDATE subscribers SET active=0, pending_catalog=0 WHERE chat_id=?", (chat_id,)
+            )
+
+    def active_chats(self) -> list[str]:
+        return [row[0] for row in self.db.execute("SELECT chat_id FROM subscribers WHERE active=1")]
+
+    def pending_catalogs(self) -> list[str]:
+        return [
+            row[0]
+            for row in self.db.execute(
+                "SELECT chat_id FROM subscribers WHERE active=1 AND pending_catalog=1"
+            )
+        ]
+
+    def catalog_text(self) -> str:
+        lines = ["CATALOGO PRODOTTI PER NEGOZIO", ""]
+        shops = self.db.execute(
+            "SELECT shop_url FROM shops WHERE initialized=1 ORDER BY shop_url"
+        ).fetchall()
+        for (shop_url,) in shops:
+            host = urlsplit(shop_url).netloc.removeprefix("www.")
+            products = self.db.execute(
+                "SELECT title, product_url FROM products WHERE shop_url=? AND active=1 "
+                "ORDER BY title COLLATE NOCASE",
+                (shop_url,),
+            ).fetchall()
+            lines.extend([f"=== {host} ({len(products)} prodotti) ===", ""])
+            for title, url in products:
+                lines.extend([title, url])
+            lines.append("")
+        return "\n".join(lines)
+
+    def catalog_sent(self, chat_id: str) -> None:
+        with self.db:
+            self.db.execute(
+                "UPDATE subscribers SET pending_catalog=0 WHERE chat_id=?", (chat_id,)
+            )
+
+    def get_update_offset(self) -> int:
+        row = self.db.execute("SELECT value FROM metadata WHERE key='telegram_update_offset'").fetchone()
+        return int(row[0]) if row else 0
+
+    def set_update_offset(self, offset: int) -> None:
+        with self.db:
+            self.db.execute(
+                "INSERT INTO metadata(key,value) VALUES('telegram_update_offset',?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (str(offset),),
             )
 
 
@@ -339,7 +425,60 @@ def send_telegram(session: requests.Session, token: str, chat_id: str, shop: str
     response.raise_for_status()
 
 
-def check_once(session: requests.Session, store: Store, shops: list[str], token: str, chat_id: str, dry_run: bool) -> None:
+def send_text(session: requests.Session, token: str, chat_id: str, message: str) -> None:
+    response = session.post(
+        f"https://api.telegram.org/bot{token}/sendMessage",
+        data={"chat_id": chat_id, "text": message},
+        timeout=20,
+    )
+    response.raise_for_status()
+
+
+def process_subscriptions(session: requests.Session, store: Store, token: str) -> None:
+    response = session.get(
+        f"https://api.telegram.org/bot{token}/getUpdates",
+        params={"offset": store.get_update_offset(), "timeout": 0, "allowed_updates": '["message"]'},
+        timeout=20,
+    )
+    response.raise_for_status()
+    for update in response.json().get("result", []):
+        store.set_update_offset(int(update["update_id"]) + 1)
+        message = update.get("message") or {}
+        chat_id = str((message.get("chat") or {}).get("id") or "")
+        text = str(message.get("text") or "").strip().split("@", 1)[0].lower()
+        if not chat_id:
+            continue
+        if text == "/start":
+            store.subscribe(chat_id)
+            send_text(
+                session,
+                token,
+                chat_id,
+                "✅ Iscrizione attivata! Riceverai a breve il catalogo dei prodotti "
+                "rilevati e, in seguito, una notifica per ogni nuovo prodotto.\n\n"
+                "Usa /stop per annullare l'iscrizione.",
+            )
+        elif text == "/stop":
+            store.unsubscribe(chat_id)
+            send_text(session, token, chat_id, "Iscrizione annullata. Non riceverai altre notifiche.")
+        elif text in {"/help", "/aiuto"}:
+            send_text(session, token, chat_id, "/start – Iscriviti alle notifiche\n/stop – Annulla l'iscrizione")
+
+
+def send_pending_catalogs(session: requests.Session, store: Store, token: str) -> None:
+    content = store.catalog_text().encode("utf-8")
+    for chat_id in store.pending_catalogs():
+        response = session.post(
+            f"https://api.telegram.org/bot{token}/sendDocument",
+            data={"chat_id": chat_id, "caption": "📋 Prodotti rilevati, suddivisi per negozio"},
+            files={"document": ("catalogo_prodotti.txt", content, "text/plain")},
+            timeout=30,
+        )
+        response.raise_for_status()
+        store.catalog_sent(chat_id)
+
+
+def check_once(session: requests.Session, store: Store, shops: list[str], token: str, chat_ids: list[str], dry_run: bool) -> None:
     for shop in shops:
         try:
             products = fetch_products(session, shop)
@@ -355,7 +494,11 @@ def check_once(session: requests.Session, store: Store, shops: list[str], token:
                     if dry_run:
                         logging.info("DRY RUN: %s - %s", product.title, product.url)
                     else:
-                        send_telegram(session, token, chat_id, shop, product)
+                        for recipient in chat_ids:
+                            try:
+                                send_telegram(session, token, recipient, shop, product)
+                            except requests.RequestException as exc:
+                                logging.error("Notifica fallita per chat %s: %s", recipient, exc)
                     store.confirm(shop, product)
             else:
                 logging.info("Nessuna novità su %s (%d prodotti)", shop, len(products))
@@ -388,12 +531,12 @@ def print_report(session: requests.Session, shops: list[str]) -> None:
 def main() -> int:
     load_dotenv(ROOT / ".env")
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    owner_chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
     dry_run = os.getenv("DRY_RUN", "false").lower() in {"1", "true", "yes"}
     once = "--once" in sys.argv
     report = "--report" in sys.argv
-    if not report and not dry_run and (not token or not chat_id):
-        print("Configura TELEGRAM_BOT_TOKEN e TELEGRAM_CHAT_ID nel file .env", file=sys.stderr)
+    if not report and not dry_run and not token:
+        print("Configura TELEGRAM_BOT_TOKEN nel file .env", file=sys.stderr)
         return 2
     try:
         interval = max(30, int(os.getenv("CHECK_INTERVAL_SECONDS", "300")))
@@ -412,6 +555,9 @@ def main() -> int:
         print_report(session, shops)
         return 0
     store = Store(DB_PATH)
+    if owner_chat_id and owner_chat_id not in store.active_chats():
+        # Mantiene compatibilità con la configurazione originale del proprietario.
+        store.subscribe(owner_chat_id)
     running = True
 
     def stop(*_):
@@ -421,7 +567,17 @@ def main() -> int:
     signal.signal(signal.SIGINT, stop)
     signal.signal(signal.SIGTERM, stop)
     while running:
-        check_once(session, store, shops, token, chat_id, dry_run)
+        if not dry_run:
+            try:
+                process_subscriptions(session, store, token)
+            except requests.RequestException as exc:
+                logging.error("Impossibile leggere i comandi Telegram: %s", exc)
+        check_once(session, store, shops, token, store.active_chats(), dry_run)
+        if not dry_run:
+            try:
+                send_pending_catalogs(session, store, token)
+            except requests.RequestException as exc:
+                logging.error("Invio catalogo non riuscito: %s", exc)
         if once:
             break
         logging.info("Prossimo controllo tra %d secondi", interval)

@@ -59,3 +59,16 @@ questi due repository secret:
 La baseline `prodotti_visti.db` viene conservata nella cache privata di GitHub
 Actions e non viene aggiunta al repository. Alla prima esecuzione vengono
 memorizzati i prodotti esistenti senza inviare notifiche.
+
+### Iscrizioni pubbliche
+
+Qualunque utente può aprire il bot su Telegram e usare:
+
+- `/start` per iscriversi, ricevere il catalogo corrente in formato `.txt` e le
+  notifiche future;
+- `/stop` per annullare l'iscrizione;
+- `/help` per visualizzare i comandi disponibili.
+
+Gli iscritti e l'ultimo comando elaborato sono salvati nello stesso database
+conservato dalla cache di Actions. Poiché il workflow parte ogni 10 minuti, la
+risposta ai comandi non è istantanea e può arrivare al controllo successivo.
